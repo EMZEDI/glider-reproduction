@@ -1,0 +1,151 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "glider-reproduction"
+version = "0.1.0"
+description = "Divide and Conquer: Grounding LLMs as Efficient Decision-Making Agents via Offline Hierarchical Reinforcement Learning"
+authors = [
+    {name = "Zican Hu", email = "huzican@nju.edu.cn"},
+    {name = "Reproduction Team"}
+]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+keywords = [
+    "reinforcement-learning",
+    "large-language-models", 
+    "hierarchical-rl",
+    "offline-rl",
+    "decision-making"
+]
+
+# Core dependencies only - the essentials for GLIDER
+dependencies = [
+    # Core ML/RL frameworks
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "accelerate>=0.20.0",
+    "datasets>=2.0.0",
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    
+    # RL Environments (Mac-compatible)
+    "alfworld==0.3.4",
+    "scienceworld==1.1.3", 
+    "gym>=0.26.0",
+    "gymnasium>=0.29.0",
+    
+    # LLM/Text processing
+    "openai>=1.0.0",
+    "tiktoken>=0.6.0",
+    "spacy>=3.7.0",
+    "nltk>=3.8.0",
+    "sentencepiece>=0.2.0",
+    
+    # Training utilities
+    "wandb>=0.15.0",
+    "hydra-core>=1.3.0",
+    "omegaconf>=2.3.0",
+    "tqdm>=4.65.0",
+    
+    # Core utilities
+    "PyYAML>=6.0.0",
+    "requests>=2.28.0",
+    "scipy>=1.10.0",
+    "matplotlib>=3.6.0",
+    "seaborn>=0.12.0",
+]
+
+[project.optional-dependencies]
+# Development tools
+dev = [
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0"
+]
+
+# Heavy optional dependencies (excluding CUDA-specific ones for Mac)
+heavy = [
+    "deepspeed>=0.14.0; sys_platform != 'darwin'",  # Skip on macOS
+    "vllm>=0.4.0; sys_platform != 'darwin'",        # Skip on macOS
+    "ray>=2.20.0",
+    "xformers>=0.0.26; sys_platform != 'darwin'"    # Skip on macOS
+]
+
+# Apple Silicon optimized dependencies
+mac-gpu = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0"
+]
+
+# CUDA dependencies for Linux/Windows
+cuda = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "deepspeed>=0.14.0",
+    "vllm>=0.4.0",
+    "xformers>=0.0.26"
+]
+
+# WebShop environment (problematic on Mac due to nmslib compilation issues)
+webshop = [
+    "webshop==0.1.0; sys_platform != 'darwin'"  # Skip on macOS
+]
+
+# Spacy model
+spacy-models = [
+    "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl"
+]
+
+# All environments (for Linux/Windows systems)
+all-envs = [
+    "webshop==0.1.0"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/NJU-RL/GLIDER"
+"Repository" = "https://github.com/EMZEDI/glider-reproduction"
+"ArXiv Paper" = "https://arxiv.org/abs/2505.19761"
+
+[project.scripts]
+glider-train = "train:main"
+glider-eval = "eval:main"
+glider-data-collect = "data_collection:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["alg*", "util*", "prompt*", "env*"]
+exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.json", "*.yaml", "*.yml", "*.csv"]
+
+# UV configuration - removed CUDA index for Mac compatibility
+[tool.uv]
+# No extra index URL - will use standard PyPI for Mac-compatible packages
+
+# Development tools configuration
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+known_first_party = ["alg", "util", "prompt", "env"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
