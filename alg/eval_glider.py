@@ -8,6 +8,8 @@ from scienceworld import ScienceWorldEnv
 import copy
 from prompt.inst import high_prompt, low_prompt,subtask_complete_prompt
 from util.extract import extract_action_done
+from util.replay_buffer import batch_traj_process
+from torch.nn.utils.rnn import pad_sequence
 
 class EvalAgent:
     def __init__(self, args):
@@ -23,11 +25,141 @@ class EvalAgent:
     def load_policy(self, path):
         Agent.load_policy(self, path)
 
+    def load_critic(self):
+        """Load the critic weights for Q-value analysis"""
+        import os
+        critic_path = os.path.join(self.checkpoint_dir, "critic.pth")
+        if os.path.exists(critic_path):
+            # Add critic to the policy if it doesn't exist
+            if not hasattr(self.engine.module, 'critic'):
+                hidden_dim = self.engine.module.base.config.hidden_size
+                import torch.nn as nn
+                self.engine.module.critic = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, hidden_dim), 
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, 1)
+                )
+            
+            critic_state_dict = torch.load(critic_path, map_location=self.engine.device)
+            self.engine.module.critic.load_state_dict(critic_state_dict)
+            print(f"Loaded critic from {critic_path}")
+        else:
+            print(f"Warning: Critic not found at {critic_path}")
+
+    @staticmethod
+    def _discounted_returns_list(rewards_list, dones_list, gamma: float):
+        """Compute Monte Carlo returns for each episode"""
+        out = []
+        for r_seq, d_seq in zip(rewards_list, dones_list):
+            T = len(r_seq)
+            G = torch.zeros(T, dtype=torch.float32)
+            running = 0.0
+            for t in range(T - 1, -1, -1):
+                running = float(r_seq[t]) + gamma * running * (1.0 - float(d_seq[t]))
+                G[t] = running
+            out.append(G)
+        return out
+
+    @staticmethod
+    def _pearson_corr(x: torch.Tensor, y: torch.Tensor) -> float:
+        if x.numel() < 2:
+            return 0.0
+        x = x.float() - x.float().mean()
+        y = y.float() - y.float().mean()
+        denom = (x.norm() * y.norm()).clamp(min=1e-8)
+        return float((x * y).sum() / denom)
+
+    @staticmethod
+    def _spearman_corr(x: torch.Tensor, y: torch.Tensor) -> float:
+        if x.numel() < 2:
+            return 0.0
+        def rankify(v: torch.Tensor) -> torch.Tensor:
+            order = torch.argsort(v)
+            ranks = torch.zeros_like(order, dtype=torch.float32)
+            ranks[order] = torch.arange(1, v.numel() + 1, device=v.device, dtype=torch.float32)
+            return ranks
+        rx = rankify(x) - rankify(x).mean()
+        ry = rankify(y) - rankify(y).mean()
+        denom = (rx.norm() * ry.norm()).clamp(min=1e-8)
+        return float((rx * ry).sum() / denom)
+
+    def extract_valid(self, value, valid_mark):
+        """Extract valid values using the same logic as training code"""
+        batch_size = value.size(0)
+        max_valid_len = valid_mark.sum(dim=1).max().item()
+
+        valid_value = torch.zeros(batch_size, max_valid_len, device=value.device)
+        mask = torch.zeros(batch_size, max_valid_len, device=value.device)
+        for i in range(batch_size):
+            valid_idx = torch.where(valid_mark[i] == 1)[0]
+            valid_len = valid_idx.size(0)
+            
+            valid_value[i, :valid_len] = value[i][valid_idx]
+            mask[i, :valid_len] = 1
+
+        return valid_value, mask
+
+    @torch.no_grad()
+    def evaluate_q_mc_from_episodes(self, episodes: dict):
+        """Compare critic Q(s_t, a_t) against Monte Carlo returns"""
+        if not hasattr(self.engine.module, 'critic'):
+            print("Warning: No critic found, skipping Q-value analysis")
+            return {}
+
+        self.engine.module.eval()
+
+        # Get critic predictions for high-level actions
+        batch_tokens = batch_traj_process(
+            episodes['task_description'],
+            episodes['obs'],
+            episodes['subtask'], 
+            self.engine.tokenizer
+        ).to(self.engine.device)
+
+        hidden_states, _, action_end_mask = self.engine.get_hidden_states(batch_tokens)
+        q_seq = self.engine.module.critic(hidden_states).squeeze(-1)  # (B, L)
+        q_sa, mask = self.extract_valid(q_seq, action_end_mask)  # (B, T_pad)
+
+        # Compute Monte Carlo returns
+        gamma = self.args.get('gama', 0.99)  # Use same gamma as training
+        G_list = self._discounted_returns_list(episodes['reward'], episodes['done'], gamma)
+        G = pad_sequence([g.to(self.engine.device) for g in G_list], batch_first=True, padding_value=0.0)
+
+        # Compare only at valid positions
+        valid = mask.bool()
+        qv = q_sa[valid]  # Critic Q estimates
+        gv = G[valid]     # True MC returns
+
+        # Compute metrics
+        diff = qv - gv
+        mse = float(diff.pow(2).mean())
+        mae = float(diff.abs().mean()) 
+        bias = float(diff.mean())
+        pearson = self._pearson_corr(qv, gv)
+        spearman = self._spearman_corr(qv, gv)
+
+        metrics = {
+            "mse": mse,
+            "mae": mae,
+            "bias": bias, 
+            "pearson_r": pearson,
+            "spearman_r": spearman,
+            "n_steps": int(valid.sum().item()),
+            "q_mean": float(qv.mean()),
+            "g_mean": float(gv.mean()),
+            "q_std": float(qv.std()) if qv.numel() > 1 else 0.0,
+            "g_std": float(gv.std()) if gv.numel() > 1 else 0.0
+        }
+
+        return metrics
+
     def eval(self, dev_or_test):
         self.load_policy(self.checkpoint_dir)
         vari_nums = pd.read_csv(f"env/{self.args['benchmark']}/task_nums.csv",encoding='utf-8')[f'{dev_or_test}'].tolist()
         task_score = {}
-        for task_id, vari_nums in enumerate(vari_nums):
+        for task_id, vari_count in enumerate(vari_nums):
             task_name = self.task_names[task_id]
             self.eval_env.load(task_name)
             task_score[task_name] = []
@@ -36,9 +168,9 @@ class EvalAgent:
             elif dev_or_test == "dev":
                 vari_ids = self.eval_env.getVariationsDev()
             else:
-                vari_ids = list(range(vari_nums))
+                vari_ids = list(range(vari_count))
             
-            for vari_id in random.sample(vari_ids, vari_nums):
+            for vari_id in random.sample(vari_ids, vari_count):
                 score = self.eval_policy(task_id, vari_id)
                 # task_reward[task_name].append(reward)
                 task_score[task_name].append(score)
@@ -50,6 +182,75 @@ class EvalAgent:
             if len(value):
                 average_score.append(sum(value)/len(value))
         print("result: ", sum(average_score)/len(average_score))
+
+    def eval_with_q_analysis(self, dev_or_test, num_episodes_per_task=5):
+        """Enhanced evaluation that collects episodes for Q-value analysis"""
+        self.load_policy(self.checkpoint_dir)
+        self.load_critic()
+        
+        vari_nums = pd.read_csv(f"env/{self.args['benchmark']}/task_nums.csv",encoding='utf-8')[f'{dev_or_test}'].tolist()
+        task_score = {}
+        
+        # Collect episodes for Q-analysis
+        all_episodes = {
+            'task_description': [],
+            'obs': [],
+            'subtask': [], 
+            'reward': [],
+            'done': []
+        }
+
+        for task_id, vari_count in enumerate(vari_nums):
+            task_name = self.task_names[task_id]
+            self.eval_env.load(task_name)
+            task_score[task_name] = []
+            
+            if dev_or_test == "test":
+                vari_ids = self.eval_env.getVariationsTest()
+            elif dev_or_test == "dev":
+                vari_ids = self.eval_env.getVariationsDev()
+            else:
+                vari_ids = list(range(vari_count))
+            
+            # Sample episodes for both scoring and Q-analysis
+            selected_varis = random.sample(vari_ids, min(num_episodes_per_task, len(vari_ids)))
+            
+            for vari_id in selected_varis:
+                score, episode_data = self.eval_policy_with_data_collection(task_id, vari_id)
+                task_score[task_name].append(score)
+                
+                # Add to episodes for Q-analysis
+                all_episodes['task_description'].append(episode_data['task_description'])
+                all_episodes['obs'].append(episode_data['obs'])
+                all_episodes['subtask'].append(episode_data['subtask'])
+                all_episodes['reward'].append(episode_data['reward'])
+                all_episodes['done'].append(episode_data['done'])
+            
+            print(f"Task {task_name}: {task_score[task_name]}")
+
+        # Compute average scores
+        average_score = []
+        for _, value in task_score.items():
+            if len(value):
+                average_score.append(sum(value)/len(value))
+        
+        final_score = sum(average_score)/len(average_score) if average_score else 0.0
+        print(f"Final average score: {final_score}")
+
+        # Analyze Q-values
+        print("\n=== Q-Value Analysis ===")
+        q_metrics = self.evaluate_q_mc_from_episodes(all_episodes)
+        if q_metrics:
+            print(f"Q-Value MSE: {q_metrics['mse']:.4f}")
+            print(f"Q-Value MAE: {q_metrics['mae']:.4f}")
+            print(f"Q-Value Bias: {q_metrics['bias']:.4f}")
+            print(f"Pearson correlation: {q_metrics['pearson_r']:.4f}")
+            print(f"Spearman correlation: {q_metrics['spearman_r']:.4f}")
+            print(f"Steps analyzed: {q_metrics['n_steps']}")
+            print(f"Q mean/std: {q_metrics['q_mean']:.3f} ± {q_metrics['q_std']:.3f}")
+            print(f"MC mean/std: {q_metrics['g_mean']:.3f} ± {q_metrics['g_std']:.3f}")
+
+        return final_score, q_metrics
 
     def eval_policy(self, task_id, vari_id):
         episode_steps = 0
@@ -109,6 +310,81 @@ class EvalAgent:
         score = max(0, info['score'])
         print(f"score: {score}")
         return score
+
+    def eval_policy_with_data_collection(self, task_id, vari_id):
+        """Modified eval_policy that also collects episode data for Q-analysis"""
+        episode_steps = 0
+        task_name = self.task_names[task_id]
+        self.eval_env.load(task_name, vari_id)
+        obs, _= self.eval_env.reset()
+        task_description = self.eval_env.taskdescription()
+        print(f"task:{task_name}, vari:{vari_id}, {task_description}")
+        
+        # Episode data collection
+        episode_data = {
+            'task_description': high_prompt + " " + task_description,
+            'obs': [],
+            'subtask': [],
+            'reward': [],
+            'done': []
+        }
+        
+        high_traj_token = self.engine.tokenizer(high_prompt + " " + task_description, return_tensors='pt')
+        done = False
+        group_action = []
+        
+        while not done:
+            state = f"Group action: {group_action}. Current observation: {obs}"
+            episode_data['obs'].append(state)
+            
+            state_token = self.engine.tokenizer(state, return_tensors='pt')
+            high_traj_token["input_ids"] = torch.cat([high_traj_token["input_ids"], state_token["input_ids"]], dim = 1)
+            high_traj_token["attention_mask"] = torch.cat([high_traj_token["attention_mask"], state_token["attention_mask"]], dim = 1)
+            subtask = self.engine.generate_action(copy.deepcopy(high_traj_token))[0]
+            print("subtask:", subtask)
+            
+            episode_data['subtask'].append(subtask)
+            
+            subtask_token = self.engine.tokenizer(subtask + self.engine.tokenizer.eos_token, return_tensors='pt')
+            high_traj_token["input_ids"] = torch.cat([high_traj_token["input_ids"], subtask_token["input_ids"]], dim = 1)
+            high_traj_token["attention_mask"] = torch.cat([high_traj_token["attention_mask"], subtask_token["attention_mask"]], dim = 1)
+
+            low_group_token = self.engine.tokenizer(low_prompt + " Subtask: " + subtask, return_tensors='pt')
+            subtask_done = False
+            group_action = []
+            raw_action_list = []
+            group_reward = 0.0
+            
+            while not subtask_done:
+                episode_steps += 1
+                obs_token = self.engine.tokenizer("Obs: "+obs, return_tensors='pt')
+                low_group_token["input_ids"] = torch.cat([low_group_token["input_ids"], obs_token["input_ids"]], dim = 1)
+                low_group_token["attention_mask"] = torch.cat([low_group_token["attention_mask"], obs_token["attention_mask"]], dim = 1)
+                raw_action = self.engine.generate_action(copy.deepcopy(low_group_token))[0]
+                raw_action_list.append(raw_action)
+                action, subtask_done = extract_action_done(raw_action)
+                group_action.append(action)
+                action_token = self.engine.tokenizer(raw_action+self.engine.tokenizer.eos_token, return_tensors='pt')
+                low_group_token["input_ids"] = torch.cat([low_group_token["input_ids"], action_token["input_ids"]], dim = 1)
+                low_group_token["attention_mask"] = torch.cat([low_group_token["attention_mask"], action_token["attention_mask"]], dim = 1)
+                obs_, reward, done, info = self.eval_env.step(action)
+                group_reward += reward / 100.0  # Normalize like in training
+                obs = obs_
+                if episode_steps == self.args['env_step_limit']:
+                    done = True
+                    break
+            
+            episode_data['reward'].append(group_reward)
+            episode_data['done'].append(done)
+            print("group action: ", raw_action_list)
+
+        # Add final observation
+        final_state = f"Group action: {group_action}. Current observation: {obs}"
+        episode_data['obs'].append(final_state)
+        
+        score = max(0, info['score'])
+        print(f"score: {score}")
+        return score, episode_data
     
     def data_collect(self, task_id, vari_id, high_data_container, low_data_container):
         """
