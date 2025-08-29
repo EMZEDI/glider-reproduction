@@ -8,7 +8,7 @@ import torch.nn as nn
 from scienceworld import ScienceWorldEnv
 import numpy as np
 from util.replay_buffer import OfflineBuffer
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 
 
@@ -29,8 +29,11 @@ class Agent:
         self.offline_buffer = OfflineBuffer(args["task_id"])
 
         if self.engine.global_rank == 0:  # Only log on the main process
-            log_dir = f"./logs/offline_ac/task{args['task_id']}/rank_{self.engine.local_rank}"
-            self.writer = SummaryWriter(log_dir=log_dir)
+            wandb.init(
+                project=f"offline-ac-task{args['task_id']}",
+                name=f"rank_{self.engine.local_rank}",
+                config=args
+            )
         self.global_step = torch.tensor(0, dtype=torch.int64).to(self.engine.device)
 
         self.eval_env = ScienceWorldEnv("", envStepLimit=args['env_step_limit'])
@@ -100,8 +103,10 @@ class Agent:
                 local_step = torch.tensor(1, dtype=torch.int64).to(device)
                 dist.all_reduce(local_step, op=dist.ReduceOp.SUM)
                 if self.engine.global_rank == 0:  # Only log on the main process
-                    self.writer.add_scalar('Loss/actor_loss', actor_loss.mean().item(), self.global_step.item())
-                    self.writer.add_scalar('Loss/critic_loss', critic_loss.item(), self.global_step.item())
+                    wandb.log({
+                        'Loss/actor_loss': actor_loss.mean().item(),
+                        'Loss/critic_loss': critic_loss.item()
+                    }, step=self.global_step.item())
 
                 if self.global_step.item() % self.args['eval_freq'] == 0:
                     eval_variation_id = np.random.randint(self.offline_buffer.train_vari_nums, self.max_variations+1)
@@ -110,10 +115,12 @@ class Agent:
                     train_reward, train_score = self.eval_policy(train_variation_id)
                     if self.engine.local_rank == 0:
                         print(f"step:{self.global_step.item()}; Reward:{eval_reward}; Score: {eval_score}")
-                        self.writer.add_scalar('eval/reward', eval_reward, self.global_step.item())
-                        self.writer.add_scalar('eval/score', eval_score, self.global_step.item())
-                        self.writer.add_scalar('train/reward', train_reward, self.global_step.item())
-                        self.writer.add_scalar('train/score', train_score, self.global_step.item())
+                        wandb.log({
+                            'eval/reward': eval_reward,
+                            'eval/score': eval_score,
+                            'train/reward': train_reward,
+                            'train/score': train_score
+                        }, step=self.global_step.item())
                 # Update global step
                 self.global_step += local_step
 
@@ -149,5 +156,5 @@ class Agent:
 
         # if self.engine.local_rank == 0:
         #     print(f"step:{self.global_step}; Reward:{average_eval_reward}; Score: {average_eval_score}")
-            
+
 

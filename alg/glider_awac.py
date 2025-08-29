@@ -1,7 +1,7 @@
 from util.model import Policy, Critic
 from alg.bc import Agent as BC_AGENT
 from util.replay_buffer import HierarchyDataset, batch_traj_process
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
@@ -60,8 +60,11 @@ class GLIDER:
         self.buffer = HierarchyDataset(args)
 
         if self.engine.global_rank == 0:
-            log_dir = f"{args['log_path']}/{args['benchmark']}/{args['alg_name']}/{args['model_name']}"
-            self.writer = SummaryWriter(log_dir=log_dir)
+            wandb.init(
+                project=f"{args['benchmark']}-{args['alg_name']}",
+                name=f"{args['model_name']}",
+                config=args
+            )
 
         self.global_step = torch.tensor(0, dtype=torch.int64).to(self.engine.device)
         self.checkpoint_dir = f"{args['check_path']}/{args['benchmark']}/{args['alg_name']}/{args['model_name']}"
@@ -154,13 +157,15 @@ class GLIDER:
                 
                 
                 if self.engine.local_rank == 0:  # Only log on the main process
-                    self.writer.add_scalar('Loss/expert/q_loss', expert_q_loss.item(), self.global_step.item())
-                    self.writer.add_scalar('Loss/expert/actor_loss', expert_actor_loss.item(), self.global_step.item())
+                    wandb.log({
+                        'Loss/expert/q_loss': expert_q_loss.item(),
+                        'Loss/expert/actor_loss': expert_actor_loss.item(),
+                        'Loss/medium/q_loss': medium_q_loss.item(),
+                        'Loss/medium/actor_loss': medium_actor_loss.item(),
+                        'Loss/low/actor_loss': low_loss.item()
+                    }, step=self.global_step.item())
                     print(f"expert; step:{self.global_step.item()}; actor_loss:{expert_actor_loss.item()}; critic_loss:{expert_q_loss.item()}")
-                    self.writer.add_scalar('Loss/medium/q_loss', medium_q_loss.item(), self.global_step.item())
-                    self.writer.add_scalar('Loss/medium/actor_loss', medium_actor_loss.item(), self.global_step.item())
                     print(f"medium; step:{self.global_step.item()}; actor_loss:{medium_actor_loss.item()}; critic_loss:{medium_q_loss.item()}")
-                    self.writer.add_scalar('Loss/low/actor_loss', low_loss, self.global_step.item())
                     print(f"low; step:{self.global_step.item()}; loss:{low_loss.item()}")
 
                 if self.global_step.item() % self.args['eval_freq'] == 0:
@@ -249,4 +254,3 @@ class GLIDER:
         done_tensor = pad_sequence(done_list, batch_first=True, padding_value=0)
         
         return reward_tensor, done_tensor
-    

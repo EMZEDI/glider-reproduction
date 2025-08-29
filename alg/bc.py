@@ -5,7 +5,7 @@ from transformers import AutoTokenizer
 from util.model import Policy
 from util.replay_buffer import SequenceDataset, batch_traj_process
 from torch.utils.data import DataLoader, DistributedSampler
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 class Agent:
     def __init__(self, args):
@@ -18,8 +18,11 @@ class Agent:
         self.buffer = SequenceDataset(args)
 
         if self.engine.global_rank == 0:
-            log_dir = f"{args['log_path']}/{args['benchmark']}/{args['alg_name']}/{args['model_name']}"
-            self.writer = SummaryWriter(log_dir=log_dir)
+            wandb.init(
+                project=f"{args['benchmark']}-{args['alg_name']}",
+                name=f"{args['model_name']}",
+                config=args
+            )
 
         self.global_step = torch.tensor(0, dtype=torch.int64).to(self.engine.device)
         self.checkpoint_dir = f"{args['check_path']}/{args['benchmark']}/{args['alg_name']}/{args['model_name']}"
@@ -62,7 +65,7 @@ class Agent:
                 self.engine.step()
 
                 if self.engine.local_rank == 0:  # Only log on the main process
-                    self.writer.add_scalar('Loss/bc_loss', bc_loss.item(), self.global_step.item())
+                    wandb.log({'Loss/bc_loss': bc_loss.item()}, step=self.global_step.item())
                     print(f"train; step:{self.global_step.item()}; Loss:{bc_loss}")
                 if self.global_step.item() % self.args['eval_freq'] == 0:
                     self.save_policy()

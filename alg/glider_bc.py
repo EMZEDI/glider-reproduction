@@ -6,7 +6,7 @@ from util.model import Policy
 from util.replay_buffer import HierarchyDataset, batch_traj_process
 from alg.bc import Agent
 from torch.utils.data import DataLoader, DistributedSampler
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 from prompt.inst import high_prompt, low_prompt
 
 class GLIDER:
@@ -21,8 +21,11 @@ class GLIDER:
         self.buffer = HierarchyDataset(args)
 
         if self.engine.global_rank == 0:
-            log_dir = f"{args['log_path']}/{args['benchmark']}/{args['alg_name']}/{args['model_name']}"
-            self.writer = SummaryWriter(log_dir=log_dir)
+            wandb.init(
+                project=f"{args['benchmark']}-{args['alg_name']}",
+                name=f"{args['model_name']}",
+                config=args
+            )
 
         self.global_step = torch.tensor(0, dtype=torch.int64).to(self.engine.device)
         self.checkpoint_dir = f"{args['check_path']}/{args['benchmark']}/{args['alg_name']}/{args['model_name']}"       
@@ -80,14 +83,17 @@ class GLIDER:
 
                 if self.engine.local_rank == 0:  # Only log on the main process
                     print(f"train; step:{self.global_step.item()}; high:{high_loss.item()}; low:{low_loss.item()}; loss:{(low_loss+high_loss).item()}")
-                    self.writer.add_scalar('step_loss/high', high_loss.item(), self.global_step.item())
-                    self.writer.add_scalar('step_loss/low', low_loss.item(), self.global_step.item())
-                    self.writer.add_scalar('step_loss/bc', (high_loss+low_loss).item(), self.global_step.item())
+                    wandb.log({
+                        'step_loss/high': high_loss.item(),
+                        'step_loss/low': low_loss.item(),
+                        'step_loss/bc': (high_loss+low_loss).item()
+                    }, step=self.global_step.item())
             
             if self.engine.local_rank == 0: # Only log on the main process
                 print(f"hierarcy-train; epoch{epoch}, high:{high_epoch_loss}, low:{low_epoch_loss}")
                 Agent.save_policy(self)
-                self.writer.add_scalar('epoch_loss/high', high_epoch_loss, epoch)
-                self.writer.add_scalar('epoch_loss/low', low_epoch_loss, epoch)
-                self.writer.add_scalar('epoch_loss/bc', high_epoch_loss+low_epoch_loss, epoch)
-            
+                wandb.log({
+                    'epoch_loss/high': high_epoch_loss,
+                    'epoch_loss/low': low_epoch_loss,
+                    'epoch_loss/bc': high_epoch_loss+low_epoch_loss
+                }, step=epoch)

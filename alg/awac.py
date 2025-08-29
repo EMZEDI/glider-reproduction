@@ -1,7 +1,7 @@
 from util.model import Policy, Critic
 from alg.bc import Agent as BC_AGENT
 from util.replay_buffer import SequenceDataset, batch_traj_process
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.nn.utils.rnn import pad_sequence
 import deepspeed
@@ -43,8 +43,11 @@ class Agent:
         self.buffer = SequenceDataset(args)
 
         if self.engine.global_rank == 0:
-            log_dir = f"{args['log_path']}/{args['benchmark']}/{args['alg_name']}/{args['model_name']}"
-            self.writer = SummaryWriter(log_dir=log_dir)
+            wandb.init(
+                project=f"{args['benchmark']}-{args['alg_name']}",
+                name=f"{args['model_name']}",
+                config=args
+            )
 
         self.global_step = torch.tensor(0, dtype=torch.int64).to(self.engine.device)
         self.checkpoint_dir = f"{args['check_path']}/{args['benchmark']}/{args['alg_name']}/{args['model_name']}"
@@ -128,10 +131,12 @@ class Agent:
                 self.engine.step()
 
                 if self.engine.local_rank == 0:  # Only log on the main process
-                    self.writer.add_scalar('Loss/q_loss', q_loss.item(), self.global_step.item())
-                    self.writer.add_scalar('Loss/v_loss', v_loss.item(), self.global_step.item())
-                    self.writer.add_scalar('Loss/critic_loss', (q_loss+v_loss).item(), self.global_step.item())
-                    self.writer.add_scalar('Loss/actor_loss', actor_loss.item(), self.global_step.item())
+                    wandb.log({
+                        'Loss/q_loss': q_loss.item(),
+                        'Loss/v_loss': v_loss.item(),
+                        'Loss/critic_loss': (q_loss+v_loss).item(),
+                        'Loss/actor_loss': actor_loss.item()
+                    }, step=self.global_step.item())
                     print(f"train; step:{self.global_step.item()}; actor_loss:{actor_loss.item()}; critic_loss:{q_loss.item(), v_loss.item(), (q_loss+v_loss).item()}")
                 if self.global_step.item() % self.args['eval_freq'] == 0:
                     BC_AGENT.save_policy(self)

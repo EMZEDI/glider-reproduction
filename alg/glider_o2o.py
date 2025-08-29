@@ -5,7 +5,7 @@ from alg.glider_awac import GLIDER as GLIDER_AWAC
 from scienceworld import ScienceWorldEnv
 from util.replay_buffer import OnlineDataset, batch_traj_process
 from torch.utils.data import DataLoader, DistributedSampler
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 import torch
 from torch.nn.utils.rnn import pad_sequence
 import torch.nn.functional as F
@@ -40,8 +40,11 @@ class GLIDER_ONLINE:
         self.buffer = OnlineDataset(args)
 
         if self.engine.global_rank == 0:
-            log_dir = f"{args['log_path']}/{args['benchmark']}/{args['alg_name']}/{args['model_name']}"
-            self.writer = SummaryWriter(log_dir=log_dir)
+            wandb.init(
+                project=f"{args['benchmark']}-{args['alg_name']}",
+                name=f"{args['model_name']}",
+                config=args
+            )
         
         self.global_step = torch.tensor(0, dtype=torch.int64).to(self.engine.device)
         self.checkpoint_dir = f"{args['check_path']}/{args['benchmark']}/{args['alg_name']}/{args['model_name']}"
@@ -70,8 +73,10 @@ class GLIDER_ONLINE:
                     self.engine.soft_update_target_critic(tau=self.args['tau'])
                     online_update_cnt += 1
                     if self.engine.local_rank == 0:
-                        self.writer.add_scalar('Loss/online/q_loss', online_q_loss.item(), self.global_step.item())
-                        self.writer.add_scalar('Loss/online/actor_loss', online_actor_loss.item(), self.global_step.item())
+                        wandb.log({
+                            'Loss/online/q_loss': online_q_loss.item(),
+                            'Loss/online/actor_loss': online_actor_loss.item()
+                        }, step=self.global_step.item())
                         print(f"step:{self.global_step.item()}; online_actor_loss, online_q_loss:{online_actor_loss.item(), online_q_loss.item()}")
                 else:
                     if self.train_vari_list[task_id]==0:
@@ -83,10 +88,12 @@ class GLIDER_ONLINE:
                     online_update_cnt = 0
 
                 if self.engine.local_rank == 0:
-                    self.writer.add_scalar('Loss/expert/q_loss', expert_q_loss.item(), self.global_step.item())
-                    self.writer.add_scalar('Loss/expert/actor_loss', expert_actor_loss.item(), self.global_step.item())
+                    wandb.log({
+                        'Loss/expert/q_loss': expert_q_loss.item(),
+                        'Loss/expert/actor_loss': expert_actor_loss.item(),
+                        'Loss/low/actor_loss': low_loss.item()
+                    }, step=self.global_step.item())
                     print(f"expert; step:{self.global_step.item()}; actor_loss:{expert_actor_loss.item()}; critic_loss:{expert_q_loss.item()}")
-                    self.writer.add_scalar('Loss/low/actor_loss', low_loss, self.global_step.item())
                     print(f"low; step:{self.global_step.item()}; loss:{low_loss.item()}")
                 if self.global_step.item() % self.args['eval_freq'] == 0:
                     BC_AGENT.save_policy(self)
@@ -116,18 +123,22 @@ class GLIDER_ONLINE:
                     self.engine.soft_update_target_critic(tau=self.args['tau'])
                     online_update_cnt += 1
                     if self.engine.local_rank == 0:
-                        self.writer.add_scalar('Loss/online/q_loss', online_q_loss.item(), self.global_step.item())
-                        self.writer.add_scalar('Loss/online/actor_loss', online_actor_loss.item(), self.global_step.item())
+                        wandb.log({
+                            'Loss/online/q_loss': online_q_loss.item(),
+                            'Loss/online/actor_loss': online_actor_loss.item()
+                        }, step=self.global_step.item())
                         print(f"step:{self.global_step.item()}; online_actor_loss, online_q_loss:{online_actor_loss.item(), online_q_loss.item()}")
                 else:
                     self.run_episode(task_id, vari_id)
                     online_update_cnt = 0
 
                 if self.engine.local_rank == 0:
-                    self.writer.add_scalar('Loss/expert/q_loss', expert_q_loss.item(), self.global_step.item())
-                    self.writer.add_scalar('Loss/expert/actor_loss', expert_actor_loss.item(), self.global_step.item())
+                    wandb.log({
+                        'Loss/expert/q_loss': expert_q_loss.item(),
+                        'Loss/expert/actor_loss': expert_actor_loss.item(),
+                        'Loss/low/actor_loss': low_loss.item()
+                    }, step=self.global_step.item())
                     print(f"expert; step:{self.global_step.item()}; actor_loss:{expert_actor_loss.item()}; critic_loss:{expert_q_loss.item()}")
-                    self.writer.add_scalar('Loss/low/actor_loss', low_loss, self.global_step.item())
                     print(f"low; step:{self.global_step.item()}; loss:{low_loss.item()}")
                 if self.global_step.item() % self.args['eval_freq'] == 0:
                     BC_AGENT.save_policy(self)
@@ -267,5 +278,5 @@ class GLIDER_ONLINE:
         else:
             print(f"No checkpoint found at {critic_path}")
 
-        
-            
+
+
