@@ -29,7 +29,11 @@ This directory contains the core algorithms for the GLIDER (Grounding LLMs as Ef
   - Optimizes both high-level and low-level policies with advantage weighting
   - Discrepancy with the paper:
     - The implementation trains the low level only with BC even during the AWAC period and the high level policy's V network is missing meaning that there is no real computation of advantage and only the Q network is used to compute it. The exponential weighting is mentioned in the algorithm but not applied practically.
+    - Algorithm:
+      - ![image](../fig/ql_42dbca2d9517db8550e128011da484a7_l3.png)
     - The low level is trained literally in the same way as it is trained during BC in the previous phase.
+  - This method essentially assumes that LLMs can learn how to fulfill subtasks with imitation learning and it mainly focuses on training the policy network (LLLM) to become a better high level planner given the code, which is not exactly described in the theory. The theory mentions that these two components both require actor-critic architecture to fully learn planning given a hierarchy...
+
 
 - **`glider_o2o.py`** — GLIDER Online-to-Offline
   - Online fine-tuning extension of GLIDER
