@@ -8,81 +8,159 @@ from prompt.inst import high_prompt, low_prompt
 from collections import deque
 import random
 
-def batch_traj_process(batch_prompt, batch_states, batch_actions, tokenizer):   # test done
-        batch_input, batch_mask, batch_labels = [], [], []
-        batch_state_end_mask, batch_action_end_mask = [], []
-        for prompt, states, actions in zip(batch_prompt, batch_states, batch_actions):
-            prompt_token = tokenizer(prompt, return_tensors='pt')
-            input_tensors = [prompt_token['input_ids']]
-            mask_tensors = [prompt_token['attention_mask']]
-            labels = [torch.full_like(input_tensors[0], -100)]
-
-            state_end_masks = [torch.zeros_like(input_tensors[0])]
-            action_end_masks = [torch.zeros_like(input_tensors[0])]
-
-            for state, action in zip(states[:-1], actions):
-                action = action + tokenizer.eos_token
-                state_token = tokenizer(state, return_tensors='pt')
-                action_token = tokenizer(action, return_tensors='pt')
-
-                state_label = torch.full_like(state_token['input_ids'], -100)
-                action_label = action_token['input_ids']
-
-                # record state and action end token position
-                state_end_mask = torch.zeros_like(state_token['input_ids'])
-                action_end_mask = torch.zeros_like(action_token['input_ids'])
-                state_end_mask[0, -1], action_end_mask[0, -1] = 1, 1 # state and action end token mark as 1
-
-                input_tensors.extend([state_token['input_ids'], action_token['input_ids']])
-                mask_tensors.extend([state_token['attention_mask'], action_token['attention_mask']])
-                labels.extend([state_label, action_label])
-                state_end_masks.extend([state_end_mask, torch.zeros_like(action_token['input_ids'])])
-                action_end_masks.extend([torch.zeros_like(state_token['input_ids']), action_end_mask])
-            
-            final_state_token = tokenizer(states[-1], return_tensors='pt')
-            final_state_label = torch.full_like(final_state_token['input_ids'], -100)
-            final_state_end_mask = torch.zeros_like(final_state_token['input_ids'])
-            final_state_end_mask[0, -1] = 1  # Marks the end position of the last state
-            
-            input_tensors.append(final_state_token['input_ids'])
-            mask_tensors.append(final_state_token['attention_mask'])
-            labels.append(final_state_label)
-            state_end_masks.append(final_state_end_mask)
-            action_end_masks.append(torch.zeros_like(final_state_token['input_ids']))
-
-            batch_input.append(torch.cat(input_tensors, dim=1))
-            batch_mask.append(torch.cat(mask_tensors, dim=1))
-            batch_labels.append(torch.cat(labels, dim=1))
-
-            batch_state_end_mask.append(torch.cat(state_end_masks, dim=1))
-            batch_action_end_mask.append(torch.cat(action_end_masks, dim=1))
-
-        # Padding
-        padded_input = torch.nn.utils.rnn.pad_sequence([x.squeeze(0) for x in batch_input], 
-                                                    batch_first=True, 
-                                                    padding_value=tokenizer.pad_token_id)
-        padded_mask = torch.nn.utils.rnn.pad_sequence([x.squeeze(0) for x in batch_mask], 
-                                                    batch_first=True, 
-                                                    padding_value=0)
-        padded_labels = torch.nn.utils.rnn.pad_sequence([x.squeeze(0) for x in batch_labels], 
-                                                    batch_first=True, 
-                                                    padding_value=-100)
-        
-        padded_state_end_mask = torch.nn.utils.rnn.pad_sequence([x.squeeze(0) for x in batch_state_end_mask],
-                                                                 batch_first=True,
-                                                                   padding_value=0)
-        padded_action_end_mask = torch.nn.utils.rnn.pad_sequence([x.squeeze(0) for x in batch_action_end_mask], 
-                                                                 batch_first=True, 
-                                                                 padding_value=0)
+def batch_traj_process(batch_prompt, batch_states, batch_actions, tokenizer, max_length=512):   # test done
+    batch_input, batch_mask, batch_labels = [], [], []
+    batch_state_end_mask, batch_action_end_mask = [], []
     
+    # Process each trajectory individually to avoid batch dimension issues
+    for prompt, states, actions in zip(batch_prompt, batch_states, batch_actions):
+        # Ensure prompt is a string
+        if isinstance(prompt, list):
+            prompt = ' '.join(str(p) for p in prompt) if prompt else ""
+        elif prompt is None:
+            prompt = ""
         
+        # Use consistent tokenization parameters with max_length constraint
+        prompt_token = tokenizer(str(prompt), return_tensors='pt', padding=False, 
+                               truncation=True, max_length=max_length//4, add_special_tokens=True)
+        input_tensors = [prompt_token['input_ids']]
+        mask_tensors = [prompt_token['attention_mask']]
+        labels = [torch.full_like(input_tensors[0], -100)]
+
+        state_end_masks = [torch.zeros_like(input_tensors[0])]
+        action_end_masks = [torch.zeros_like(input_tensors[0])]
+
+        current_length = input_tensors[0].size(1)
+        
+        for state, action in zip(states[:-1], actions):
+            # Ensure state and action are strings
+            if isinstance(state, list):
+                state = ' '.join(str(s) for s in state) if state else ""
+            if isinstance(action, list):
+                action = ' '.join(str(a) for a in action) if action else ""
+            
+            action = str(action) + tokenizer.eos_token
+            
+            # Calculate remaining length budget
+            remaining_length = max_length - current_length
+            if remaining_length <= 10:  # Reserve some tokens for final state
+                break
+                
+            # Use consistent tokenization parameters with dynamic max_length
+            state_max_len = min(remaining_length // 2, 256)
+            action_max_len = min(remaining_length // 2, 256)
+            
+            state_token = tokenizer(str(state), return_tensors='pt', padding=False, 
+                                  truncation=True, max_length=state_max_len, add_special_tokens=True)
+            action_token = tokenizer(action, return_tensors='pt', padding=False, 
+                                   truncation=True, max_length=action_max_len, add_special_tokens=True)
+
+            # Update current length
+            current_length += state_token['input_ids'].size(1) + action_token['input_ids'].size(1)
+            
+            state_label = torch.full_like(state_token['input_ids'], -100)
+            action_label = action_token['input_ids']
+
+            # record state and action end token position
+            state_end_mask = torch.zeros_like(state_token['input_ids'])
+            action_end_mask = torch.zeros_like(action_token['input_ids'])
+            state_end_mask[0, -1], action_end_mask[0, -1] = 1, 1 # state and action end token mark as 1
+
+            input_tensors.extend([state_token['input_ids'], action_token['input_ids']])
+            mask_tensors.extend([state_token['attention_mask'], action_token['attention_mask']])
+            labels.extend([state_label, action_label])
+            state_end_masks.extend([state_end_mask, torch.zeros_like(action_token['input_ids'])])
+            action_end_masks.extend([torch.zeros_like(state_token['input_ids']), action_end_mask])
+        
+        # Use consistent tokenization for final state
+        final_state = states[-1]
+        if isinstance(final_state, list):
+            final_state = ' '.join(str(s) for s in final_state) if final_state else ""
+        
+        # Calculate remaining length for final state
+        remaining_length = max_length - current_length
+        final_state_max_len = min(remaining_length, 256)
+        
+        final_state_token = tokenizer(str(final_state), return_tensors='pt', padding=False, 
+                                    truncation=True, max_length=final_state_max_len, add_special_tokens=True)
+        
+        final_state_label = torch.full_like(final_state_token['input_ids'], -100)
+        final_state_end_mask = torch.zeros_like(final_state_token['input_ids'])
+        final_state_end_mask[0, -1] = 1  # Marks the end position of the last state
+        
+        input_tensors.append(final_state_token['input_ids'])
+        mask_tensors.append(final_state_token['attention_mask'])
+        labels.append(final_state_label)
+        state_end_masks.append(final_state_end_mask)
+        action_end_masks.append(torch.zeros_like(final_state_token['input_ids']))
+
+        try:
+            sequence = torch.cat(input_tensors, dim=1)
+            # Ensure sequence doesn't exceed max_length
+            if sequence.size(1) > max_length:
+                sequence = sequence[:, :max_length]
+                mask_seq = torch.cat(mask_tensors, dim=1)[:, :max_length]
+                label_seq = torch.cat(labels, dim=1)[:, :max_length]
+                state_end_seq = torch.cat(state_end_masks, dim=1)[:, :max_length]
+                action_end_seq = torch.cat(action_end_masks, dim=1)[:, :max_length]
+            else:
+                mask_seq = torch.cat(mask_tensors, dim=1)
+                label_seq = torch.cat(labels, dim=1)
+                state_end_seq = torch.cat(state_end_masks, dim=1)
+                action_end_seq = torch.cat(action_end_masks, dim=1)
+                
+            batch_input.append(sequence)
+            batch_mask.append(mask_seq)
+            batch_labels.append(label_seq)
+            batch_state_end_mask.append(state_end_seq)
+            batch_action_end_mask.append(action_end_seq)
+            
+        except RuntimeError as e:
+            # Debug output if concatenation fails
+            sizes = [t.size() for t in input_tensors]
+            print(f"Error concatenating tensors with shapes: {sizes}")
+            print(f"Prompt: {prompt[:100]}...")  # Truncate for readability
+            raise e
+
+    if not batch_input:
+        # Return empty batch if no valid sequences
         return BatchEncoding({
-            "input_ids": padded_input,
-            "attention_mask": padded_mask,
-            "labels": padded_labels,
-            "state_end_mask": padded_state_end_mask,
-            "action_end_mask": padded_action_end_mask
+            "input_ids": torch.empty(0, 0, dtype=torch.long),
+            "attention_mask": torch.empty(0, 0, dtype=torch.long),
+            "labels": torch.empty(0, 0, dtype=torch.long),
+            "state_end_mask": torch.empty(0, 0, dtype=torch.long),
+            "action_end_mask": torch.empty(0, 0, dtype=torch.long)
         })
+
+    # Ensure all sequences have the same length before padding
+    max_seq_length = min(max(x.size(1) for x in batch_input), max_length)
+    
+    # Padding with proper token IDs
+    padded_input = torch.nn.utils.rnn.pad_sequence([x.squeeze(0) for x in batch_input], 
+                                                batch_first=True, 
+                                                padding_value=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id)
+    padded_mask = torch.nn.utils.rnn.pad_sequence([x.squeeze(0) for x in batch_mask], 
+                                                batch_first=True, 
+                                                padding_value=0)
+    padded_labels = torch.nn.utils.rnn.pad_sequence([x.squeeze(0) for x in batch_labels], 
+                                                batch_first=True, 
+                                                padding_value=-100)
+    
+    padded_state_end_mask = torch.nn.utils.rnn.pad_sequence([x.squeeze(0) for x in batch_state_end_mask],
+                                                                batch_first=True,
+                                                                padding_value=0)
+    padded_action_end_mask = torch.nn.utils.rnn.pad_sequence([x.squeeze(0) for x in batch_action_end_mask], 
+                                                                batch_first=True, 
+                                                                padding_value=0)
+
+    
+    return BatchEncoding({
+        "input_ids": padded_input,
+        "attention_mask": padded_mask,
+        "labels": padded_labels,
+        "state_end_mask": padded_state_end_mask,
+        "action_end_mask": padded_action_end_mask
+    })
 
 
 class SequenceDataset(Dataset):
@@ -238,6 +316,7 @@ class HierarchyDataset(Dataset):
         low_idx = idx % self.low_len
         if self.args['mode'] == 'rl':
             medium_idx = idx % self.medium_len
+            print(medium_idx)
             return {
                 'high':{key: value[high_idx] for key, value in self.high_data.items()},
                 'low':{key: value[low_idx] for key, value in self.low_data.items()},

@@ -1,5 +1,16 @@
-export SLURM_JOB_ID=3925846
-srun \
- -p MoE \
- -w SH-IDCA1404-10-140-54-102\
- deepspeed --num_gpus 1 --master_port=29507 glider_data_collection.py
+#!/bin/bash
+#SBATCH --job-name=glider_collection
+#SBATCH --nodes=1
+#SBATCH --gpus-per-node=h100:4
+#SBATCH --ntasks-per-node=4
+#SBATCH --cpus-per-task=6
+#SBATCH --mem=0
+#SBATCH --time=24:00:00
+#SBATCH --account=aip-rrabba
+#SBATCH --output=%x-%j.out
+#SBATCH --error=%x-%j.err
+
+
+source .env
+module load java/21.0.1
+deepspeed --num_gpus 4 glider_data_collection.py

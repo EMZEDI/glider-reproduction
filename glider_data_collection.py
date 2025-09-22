@@ -8,7 +8,7 @@ def get_free_gpus(num_gpus_needed):
     return available_gpus
 
 num_gpus = int(os.environ.get('WORLD_SIZE', 1))
-
+print(f"using {num_gpus} gpus for the task")
 free_gpus = get_free_gpus(num_gpus)
 os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, free_gpus))
 

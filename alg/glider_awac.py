@@ -68,6 +68,10 @@ class GLIDER:
 
         self.global_step = torch.tensor(0, dtype=torch.int64).to(self.engine.device)
         self.checkpoint_dir = f"{args['check_path']}/{args['benchmark']}/{args['alg_name']}/{args['model_name']}"
+        
+        # Add trajectory logging configuration
+        self.log_interval = args.get('trajectory_log_interval', 100)  # Log every N steps
+        self.max_trajectories_to_log = args.get('max_trajectories_to_log', 3)  # Max trajectories per log
     
     def save_critic(self):
         model_path = os.path.join(self.checkpoint_dir, "critic.pth")
@@ -135,13 +139,17 @@ class GLIDER:
                 Update Actor:
                     L_\pai(\theta) = -E_{s,a~D}[exp(1/lammda * A(s,a)) * log\pai_\theta(a|s)]
                 """
+                
+                # Log trajectories to WandB every N steps
+                if (self.engine.local_rank == 0 and 
+                    self.global_step.item() % self.log_interval == 0):
+                    self.log_trajectories_to_wandb(batch, self.global_step.item())
+                
                 # high level
                 expert_q_loss, expert_actor_loss = self.update_ac(batch['high'])
                 medium_q_loss, medium_actor_loss = self.update_ac(batch['medium'])
                
                 self.engine.soft_update_target_critic(tau=self.args['tau'])
-
-                
             
                 # low level
                 batch_low_tokens = batch_traj_process(batch['low']['subtask'],
@@ -174,6 +182,244 @@ class GLIDER:
                 self.global_step += 1
         BC_AGENT.save_policy(self)
         self.save_critic()
+
+    def _log_qvalue_analysis(self, expert_data, medium_data, step):
+        """Log Q-value vs Monte Carlo return comparison"""
+        try:
+            for level_name, data in [("expert", expert_data), ("medium", medium_data)]:
+                if 'reward' in data and 'obs' in data:
+                    # Compute Monte Carlo returns
+                    mc_returns = self._compute_monte_carlo_returns(data['reward'])
+                    
+                    # Get Q-value predictions from critic
+                    q_predictions = self._get_q_value_predictions(data)
+                    
+                    if mc_returns is not None and q_predictions is not None:
+                        # Compute metrics
+                        td_errors = torch.abs(q_predictions - mc_returns)
+                        mse_loss = torch.mean((q_predictions - mc_returns) ** 2)
+                        mae_loss = torch.mean(td_errors)
+                        
+                        wandb.log({
+                            f"q_analysis/{level_name}/td_error_mean": td_errors.mean().item(),
+                            f"q_analysis/{level_name}/td_error_std": td_errors.std().item(),
+                            f"q_analysis/{level_name}/mse_loss": mse_loss.item(),
+                            f"q_analysis/{level_name}/mae_loss": mae_loss.item(),
+                            f"q_analysis/{level_name}/q_mean": q_predictions.mean().item(),
+                            f"q_analysis/{level_name}/mc_mean": mc_returns.mean().item(),
+                        }, step=step)
+                        
+        except Exception as e:
+            print(f"Warning: Failed to compute Q-value analysis: {e}")
+
+    def _compute_monte_carlo_returns(self, rewards):
+        """Compute Monte Carlo returns (discounted cumulative rewards)"""
+        try:
+            gamma = self.args.get('gama', 0.99)  # Note: typo in original code
+            mc_returns_list = []
+            
+            for traj_rewards in rewards[:self.max_trajectories_to_log]:
+                returns = []
+                G = 0
+                # Compute returns backwards
+                for r in reversed(traj_rewards):
+                    G = r + gamma * G
+                    returns.append(G)
+                mc_returns_list.append(torch.tensor(list(reversed(returns))))
+            
+            if mc_returns_list:
+                return torch.cat(mc_returns_list)
+            return None
+        except:
+            return None
+
+    def _get_q_value_predictions(self, data):
+        """Get Q-value predictions from the critic for comparison"""
+        try:
+            # Process a small batch to get Q-values
+            batch_tokens = batch_traj_process(
+                data['task_description'][:self.max_trajectories_to_log],
+                data['obs'][:self.max_trajectories_to_log], 
+                data['subtask'][:self.max_trajectories_to_log],
+                self.engine.tokenizer
+            ).to(self.engine.device)
+            
+            with torch.no_grad():
+                hidden_states, _, action_end_mask = self.engine.get_hidden_states(batch_tokens)
+                q_values = self.engine.critic_forward(hidden_states)
+                valid_q_values, _ = self.extract_valid(q_values, action_end_mask)
+                
+            return valid_q_values.flatten()
+        except:
+            return None
+
+    def log_trajectories_to_wandb(self, batch, step):
+        """Log AWAC trajectories to WandB with reward/value information"""
+        if self.engine.local_rank != 0:  # Only log on main process
+            return
+        
+        try:
+            # Extract data for all levels (expert, medium, low)
+            expert_data = batch['high']
+            medium_data = batch['medium'] 
+            low_data = batch['low']
+            
+            # 1. AWAC-specific Timeline with Q-values and Rewards
+            timeline_html = self._create_awac_timeline(expert_data, medium_data, low_data, step)
+            wandb.log({"awac_trajectories/timeline": wandb.Html(timeline_html)}, step=step)
+            
+            # 2. Reward/Value Analysis Dashboard
+            self._log_reward_analysis(expert_data, medium_data, step)
+            
+            # 3. Policy Performance Comparison Table
+            self._log_policy_comparison(expert_data, medium_data, low_data, step)
+            
+            # 4. Q-value vs Monte Carlo Analysis (NEW!)
+            self._log_qvalue_analysis(expert_data, medium_data, step)
+            
+        except Exception as e:
+            print(f"Warning: Failed to log AWAC trajectories to WandB: {e}")
+            wandb.log({"awac_trajectory_error": str(e)}, step=step)
+
+    def _create_awac_timeline(self, expert_data, medium_data, low_data, step):
+        """Create AWAC-specific timeline with rewards and Q-values"""
+        html = f"""
+        <html>
+        <head>
+            <style>
+                .awac-timeline {{ font-family: Arial, sans-serif; margin: 20px; }}
+                .level-section {{ border: 2px solid #333; margin: 20px 0; padding: 15px; border-radius: 10px; }}
+                .expert {{ background: linear-gradient(90deg, #e8f5e8, #d4f1d4); border-color: #4caf50; }}
+                .medium {{ background: linear-gradient(90deg, #fff3e0, #ffe0b2); border-color: #ff9800; }}
+                .low {{ background: linear-gradient(90deg, #e3f2fd, #bbdefb); border-color: #2196f3; }}
+                .level-header {{ font-size: 18px; font-weight: bold; margin-bottom: 15px; }}
+                .trajectory {{ margin: 10px 0; padding: 10px; background: rgba(255,255,255,0.7); border-radius: 5px; }}
+                .step {{ margin: 5px 0; padding: 8px; background: #f9f9f9; border-radius: 3px; border-left: 3px solid #ddd; }}
+                .reward {{ color: #d32f2f; font-weight: bold; }}
+                .task {{ color: #1976d2; font-weight: bold; }}
+                .action {{ color: #7b1fa2; }}
+                .obs {{ color: #388e3c; font-style: italic; }}
+                .metrics {{ background: #f5f5f5; padding: 5px; margin: 5px 0; border-radius: 3px; font-size: 12px; }}
+            </style>
+        </head>
+        <body>
+            <div class="awac-timeline">
+                <h2>AWAC Hierarchical Training - Step {step}</h2>
+        """
+        
+        # Expert trajectories
+        html += self._create_level_section("EXPERT", expert_data, "expert")
+        # Medium trajectories  
+        html += self._create_level_section("MEDIUM", medium_data, "medium")
+        # Low-level trajectories
+        html += self._create_level_section("LOW-LEVEL", low_data, "low")
+        
+        html += "</div></body></html>"
+        return html
+
+    def _create_level_section(self, level_name, data, css_class):
+        """Create a section for one level of the hierarchy"""
+        html = f"""
+            <div class="level-section {css_class}">
+                <div class="level-header">{level_name} POLICY</div>
+        """
+        
+        # Extract data (limit to first few trajectories)
+        max_trajs = min(2, len(data.get('task_description', [])))
+        
+        for i in range(max_trajs):
+            task_desc = data['task_description'][i] if 'task_description' in data else data.get('subtask', ['N/A'])[i]
+            obs_list = data['obs'][i] if 'obs' in data else []
+            action_list = data.get('subtask', data.get('action', []))[i] if i < len(data.get('subtask', data.get('action', []))) else []
+            rewards = data.get('reward', [[0]*len(action_list)])[i] if 'reward' in data else [0]*len(action_list)
+            dones = data.get('done', [[0]*len(action_list)])[i] if 'done' in data else [0]*len(action_list)
+            
+            html += f"""
+                <div class="trajectory">
+                    <div class="task">Task: {str(task_desc)[:150]}...</div>
+                    <div class="metrics">
+                        Trajectory Length: {len(action_list)} | 
+                        Total Reward: {sum(rewards):.2f} | 
+                        Completed: {"Yes" if any(dones) else "No"}
+                    </div>
+            """
+            
+            # Show first few steps
+            for j, (obs, action, reward) in enumerate(zip(obs_list[:5], action_list[:5], rewards[:5])):
+                html += f"""
+                    <div class="step">
+                        <div class="obs">Obs: {str(obs)[:100]}...</div>
+                        <div class="action">Action: {str(action)[:80]}...</div>
+                        <div class="reward">Reward: {reward:.3f}</div>
+                    </div>
+                """
+            
+            if len(action_list) > 5:
+                html += f'<div class="step">... and {len(action_list)-5} more steps</div>'
+            
+            html += "</div>"
+        
+        html += "</div>"
+        return html
+
+    def _log_reward_analysis(self, expert_data, medium_data, step):
+        """Log reward and performance analysis"""
+        expert_rewards = expert_data.get('reward', [])
+        medium_rewards = medium_data.get('reward', [])
+        
+        if expert_rewards and medium_rewards:
+            # Calculate statistics
+            expert_total_rewards = [sum(traj_rewards) for traj_rewards in expert_rewards]
+            medium_total_rewards = [sum(traj_rewards) for traj_rewards in medium_rewards]
+            
+            expert_avg_reward = sum(expert_total_rewards) / len(expert_total_rewards)
+            medium_avg_reward = sum(medium_total_rewards) / len(medium_total_rewards)
+            
+            wandb.log({
+                "awac_stats/expert_avg_reward": expert_avg_reward,
+                "awac_stats/medium_avg_reward": medium_avg_reward,
+                "awac_stats/reward_gap": expert_avg_reward - medium_avg_reward,
+                "awac_stats/expert_max_reward": max(expert_total_rewards),
+                "awac_stats/medium_max_reward": max(medium_total_rewards),
+                "awac_stats/expert_traj_length": sum(len(r) for r in expert_rewards) / len(expert_rewards),
+                "awac_stats/medium_traj_length": sum(len(r) for r in medium_rewards) / len(medium_rewards),
+            }, step=step)
+
+    def _log_policy_comparison(self, expert_data, medium_data, low_data, step):
+        """Create comparison table across policy levels"""
+        comparison_columns = ["Policy_Level", "Avg_Reward", "Avg_Length", "Success_Rate", "Sample_Task"]
+        comparison_data = []
+        
+        for level_name, data in [("Expert", expert_data), ("Medium", medium_data), ("Low", low_data)]:
+            if 'reward' in data and data['reward']:
+                rewards = data['reward']
+                avg_reward = sum(sum(r) for r in rewards) / len(rewards)
+                avg_length = sum(len(r) for r in rewards) / len(rewards)
+                success_rate = sum(any(data.get('done', [[]])[i]) for i in range(len(rewards))) / len(rewards)
+                sample_task = str(data.get('task_description', data.get('subtask', ['N/A']))[0])[:100]
+                
+                comparison_data.append([
+                    level_name,
+                    f"{avg_reward:.3f}",
+                    f"{avg_length:.1f}",
+                    f"{success_rate:.2%}",
+                    sample_task + "..."
+                ])
+        
+        if comparison_data:
+            comparison_table = wandb.Table(columns=comparison_columns, data=comparison_data)
+            wandb.log({"awac_trajectories/policy_comparison": comparison_table}, step=step)
+
+    def _log_qvalue_stats(self, expert_data, medium_data, step):
+        """Log Q-value related statistics (placeholder for now)"""
+        # This would require computing Q-values for the current batch
+        # For now, log basic trajectory statistics
+        stats = {
+            "awac_stats/expert_batch_size": len(expert_data.get('reward', [])),
+            "awac_stats/medium_batch_size": len(medium_data.get('reward', [])),
+            "awac_stats/total_trajectories": len(expert_data.get('reward', [])) + len(medium_data.get('reward', [])),
+        }
+        wandb.log(stats, step=step)
 
     def get_policy_q(self, batch_prompt, batch_obs_list, batch_action_list):
         """
@@ -234,7 +480,6 @@ class GLIDER:
 
         return valid_value, mask
     
-    
 
     def prepare_tensor(self, rewards, dones):
         """
@@ -254,3 +499,5 @@ class GLIDER:
         done_tensor = pad_sequence(done_list, batch_first=True, padding_value=0)
         
         return reward_tensor, done_tensor
+
+    
